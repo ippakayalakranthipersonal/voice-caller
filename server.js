@@ -69,7 +69,7 @@ function listen(id, text) {
   const url = `${PUBLIC_URL}/voice?id=${id}`;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${esc(url)}" method="POST" speechTimeout="auto" timeout="6" language="en-US">
+  <Gather input="speech" action="${esc(url)}" method="POST" speechTimeout="auto" timeout="6" language="en-IN">
     ${sayTag(text)}
   </Gather>
   <Redirect method="POST">${esc(url)}</Redirect>
