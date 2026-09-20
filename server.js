@@ -5,10 +5,11 @@ const {
   TELEGRAM_BOT_TOKEN: TOKEN,
   TELEGRAM_CHAT_ID: OWNER_ID, // your own Telegram chat ID (results are sent here)
   GEMINI_API_KEY,
-  GEMINI_MODEL = "gemini-2.5-flash-lite", // check aistudio.google.com for the current free model ID
+  GEMINI_MODEL = "gemini-3.5-flash-lite", // check aistudio.google.com for the current free model ID
   PUBLIC_URL,
   API_SECRET,
   OWNER_NAME = "my owner", // how the bot refers to you, e.g. "Kranthi"
+  MAX_TURNS = "40", // max messages from the person in a /task conversation
   UPSTASH_REDIS_REST_URL: KV_URL, // optional: free Redis so links survive restarts
   UPSTASH_REDIS_REST_TOKEN: KV_TOKEN,
   PORT = 3000,
@@ -27,6 +28,8 @@ for (const [name, value] of Object.entries({
   }
 }
 
+const MAX_TURNS_TASK = Number(MAX_TURNS) || 40;
+const MAX_TURNS_ASK = 12;
 const BASE_URL = PUBLIC_URL.replace(/\/+$/, "");
 // Telegram will send this secret with every webhook call so we can reject fakes.
 const WEBHOOK_SECRET = crypto.createHash("sha256").update(API_SECRET).digest("hex");
@@ -34,15 +37,15 @@ const WEBHOOK_SECRET = crypto.createHash("sha256").update(API_SECRET).digest("he
 const app = express();
 app.use(express.json());
 
-const HELP = `Hi! I can check people's availability for you.
+const HELP = `Hi! I can chat with people for you and message you the result.
 
-Send me:
-/ask Your question? | Follow-up if they say yes?
+1) Quick question (optional follow-up if they say yes):
+/ask Are you free for a call this week? | What day and time works best?
 
-I'll give you a link to send. When they tap it, I chat with them and message you their answer.
+2) Longer conversation, any topic. Describe what you want in your own words:
+/task Ask about their availability next week, their preferred time zone, and whether they want a call or video meeting. Be friendly and ask one thing at a time.
 
-Example:
-/ask Are you free for a quick call this week? | What day and time works best?`;
+Either way I give you a link to send. When they tap it, I chat with them and message you what they said.`;
 
 // ---------------------------------------------------------------------------
 // Tiny key-value store. Uses free Upstash Redis if configured, else memory.
@@ -100,6 +103,13 @@ async function tg(method, body = {}) {
 }
 
 const send = (chat_id, text) => tg("sendMessage", { chat_id, text });
+
+// Telegram messages max out at 4096 characters, so split long text.
+async function sendLong(chat_id, text) {
+  for (let i = 0; i < text.length; i += 3800) {
+    await send(chat_id, text.slice(i, i + 3800));
+  }
+}
 
 async function getBotUsername() {
   if (!botUsername) {
@@ -165,7 +175,8 @@ async function handleMessage(msg) {
     );
   }
 
-  if (isOwner && /^\/ask(@\w+)?(\s|$)/i.test(text)) return createRequest(chatId, text);
+  if (isOwner && /^\/ask(@\w+)?(\s|$)/i.test(text)) return createAsk(chatId, text);
+  if (isOwner && /^\/task(@\w+)?(\s|$)/i.test(text)) return createTask(chatId, text);
   if (isOwner && /^\/help(@\w+)?(\s|$)/i.test(text)) return send(chatId, HELP);
   if (/^\/stop(@\w+)?(\s|$)/i.test(text)) return stopConversation(chatId, name);
 
@@ -182,8 +193,22 @@ async function handleMessage(msg) {
   return continueConversation(chatId, conv, text);
 }
 
-// Owner: /ask Question? | Follow-up?
-async function createRequest(chatId, text) {
+// ---------------------------------------------------------------------------
+// Owner creates a link
+// ---------------------------------------------------------------------------
+async function makeLink(chatId, req, description) {
+  const id = crypto.randomBytes(6).toString("base64url");
+  await kvSet(`req:${id}`, req, 7 * 24 * 3600);
+  const username = await getBotUsername();
+  return send(
+    chatId,
+    `Done! Send this link to the person:\nhttps://t.me/${username}?start=${id}\n\n${description}\n\n` +
+      `I'll message you here with the result. The link works for 7 days and can be used by several people.`
+  );
+}
+
+// /ask Question? | Follow-up?
+async function createAsk(chatId, text) {
   const rest = text.replace(/^\/ask(@\w+)?\s*/i, "");
   const [question, ...more] = rest.split("|");
   const q = question.trim();
@@ -195,20 +220,37 @@ async function createRequest(chatId, text) {
       "Usage:\n/ask Your question? | Follow-up if yes?\n\nExample:\n/ask Are you free for a quick call this week? | What day and time works best?"
     );
   }
-
-  const id = crypto.randomBytes(6).toString("base64url");
-  await kvSet(`req:${id}`, { question: q, followUp, ownerName: OWNER_NAME }, 7 * 24 * 3600);
-
-  const username = await getBotUsername();
-  const link = `https://t.me/${username}?start=${id}`;
-  return send(
+  return makeLink(
     chatId,
-    `Done! Send this link to the person:\n${link}\n\n` +
-      `When they tap Start, I'll ask:\n"${q}"` +
-      (followUp ? `\nIf they say yes, I'll then ask:\n"${followUp}"` : "") +
-      `\n\nI'll message you here with the result. The link works for 7 days and can be used by several people.`
+    { mode: "ask", question: q, followUp, ownerName: OWNER_NAME },
+    `When they tap Start, I'll ask:\n"${q}"` +
+      (followUp ? `\nIf they say yes, I'll then ask:\n"${followUp}"` : "")
   );
 }
+
+// /task <free-text instructions>
+async function createTask(chatId, text) {
+  const instructions = text.replace(/^\/task(@\w+)?\s*/i, "").trim();
+  if (instructions.length < 10) {
+    return send(
+      chatId,
+      "Describe what you want me to do, in your own words.\n\nExample:\n/task Ask about their availability next week, preferred time zone, and whether they want a call or a video meeting. Be friendly and ask one thing at a time."
+    );
+  }
+  const preview = instructions.length > 300 ? instructions.slice(0, 300) + "..." : instructions;
+  return makeLink(
+    chatId,
+    { mode: "task", instructions, ownerName: OWNER_NAME },
+    `I'll have a conversation following your instructions:\n"${preview}"`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Conversations
+// ---------------------------------------------------------------------------
+const intro = (req, name) =>
+  `Hi ${name}! I'm an AI assistant messaging on behalf of ${req.ownerName}. ` +
+  `Your replies will be shared with them. You can send /stop at any time.`;
 
 // Anyone: opened a link
 async function beginConversation(chatId, name, linkId) {
@@ -217,19 +259,33 @@ async function beginConversation(chatId, name, linkId) {
     return send(chatId, "Sorry, this link has expired or isn't valid. Please ask for a new one.");
   }
 
-  const opening =
-    `Hi ${name}! I'm an AI assistant messaging on behalf of ${req.ownerName}. ` +
-    `Your replies will be shared with them. You can send /stop at any time.\n\n${req.question}`;
+  const mode = req.mode || "ask";
+  const conv = { ...req, mode, name, opening: "", history: [], transcript: [], turns: 0, done: false };
+  let opening;
 
-  const conv = {
-    ...req,
-    name,
-    opening,
-    history: [], // Gemini format: { role: "user" | "model", text }
-    transcript: [{ who: "assistant", text: opening }],
-    turns: 0,
-    done: false,
-  };
+  if (mode === "task") {
+    // Let the AI write its own first message based on the instructions.
+    conv.history.push({ role: "user", text: "(The person just tapped Start. Send your first message.)" });
+    await tg("sendChatAction", { chat_id: chatId, action: "typing" });
+    let turn;
+    try {
+      turn = await askGemini(conv);
+    } catch (err) {
+      console.error("Gemini error:", err.message);
+      await send(chatId, "Sorry, I'm having a technical problem. Please try the link again in a few minutes.");
+      await send(OWNER_ID, `⚠️ AI error when ${name} opened your link.`);
+      return;
+    }
+    const say = (turn.say || "").trim() || "Hi! Ready when you are.";
+    conv.history.push({ role: "model", text: JSON.stringify(turn) });
+    conv.transcript.push({ who: "assistant", text: say });
+    opening = `${intro(req, name)}\n\n${say}`;
+  } else {
+    opening = `${intro(req, name)}\n\n${req.question}`;
+    conv.opening = opening;
+    conv.transcript.push({ who: "assistant", text: opening });
+  }
+
   await kvSet(`conv:${chatId}`, conv, 24 * 3600);
   await send(chatId, opening);
 
@@ -262,13 +318,18 @@ async function continueConversation(chatId, conv, text) {
   conv.transcript.push({ who: "assistant", text: say });
 
   // Safety cap so a chat can never run forever.
-  const finished = Boolean(turn.done) || conv.turns >= 12;
+  const maxTurns = conv.mode === "task" ? MAX_TURNS_TASK : MAX_TURNS_ASK;
+  const hitLimit = !turn.done && conv.turns >= maxTurns;
+  const finished = Boolean(turn.done) || hitLimit;
   conv.done = finished;
   await kvSet(`conv:${chatId}`, conv, 24 * 3600);
 
   await send(chatId, say);
   if (finished) {
-    await reportResult(conv, turn.done ? turn : { available: "unclear", notes: "Conversation ran long." });
+    await reportResult(
+      conv,
+      hitLimit ? { available: "unclear", notes: "The conversation reached its length limit." } : turn
+    );
   }
 }
 
@@ -279,10 +340,33 @@ async function stopConversation(chatId, name) {
     conv.done = true;
     await kvSet(`conv:${chatId}`, conv, 24 * 3600);
     await send(OWNER_ID, `🛑 ${name} stopped the conversation.`);
+    if (conv.mode === "task" && conv.turns > 0) await sendTranscript(conv);
   }
 }
 
+async function sendTranscript(conv) {
+  const body = conv.transcript
+    .map((t) => `${t.who === "assistant" ? "Bot" : conv.name}: ${t.text}`)
+    .join("\n\n");
+  await sendLong(OWNER_ID, `📝 Full conversation with ${conv.name}:\n\n${body}`);
+}
+
 async function reportResult(conv, turn) {
+  console.log("RESULT:", JSON.stringify({ name: conv.name, ...turn, transcript: conv.transcript }));
+
+  if (conv.mode === "task") {
+    const lines = [`✅ ${conv.name} finished the conversation`];
+    if (turn.summary) lines.push("", `Summary: ${turn.summary}`);
+    if (Array.isArray(turn.answers) && turn.answers.length) {
+      lines.push("", "Answers:");
+      for (const a of turn.answers) lines.push(`• ${a.question}: ${a.answer}`);
+    }
+    if (turn.notes) lines.push("", `Notes: ${turn.notes}`);
+    await sendLong(OWNER_ID, lines.join("\n"));
+    await sendTranscript(conv);
+    return;
+  }
+
   const lines = [
     `✅ ${conv.name} replied`,
     `Question: ${conv.question}`,
@@ -290,8 +374,6 @@ async function reportResult(conv, turn) {
   ];
   if (turn.time) lines.push(`Time: ${turn.time}`);
   if (turn.notes) lines.push(`Notes: ${turn.notes}`);
-
-  console.log("RESULT:", JSON.stringify({ name: conv.name, ...turn, transcript: conv.transcript }));
   await send(OWNER_ID, lines.join("\n"));
 }
 
@@ -299,8 +381,39 @@ async function reportResult(conv, turn) {
 // Gemini (free tier) is the brain. We ask for strict JSON every turn.
 // ---------------------------------------------------------------------------
 function buildSystemPrompt(c) {
+  const today = new Date().toDateString();
+
+  if (c.mode === "task") {
+    return `You are a friendly assistant chatting on Telegram on behalf of ${c.ownerName}. You are messaging ${c.name}.
+Today's date is ${today}.
+
+${c.ownerName}'s instructions for this conversation (follow them closely):
+"""
+${c.instructions}
+"""
+
+A greeting saying who you are (and that you're an AI) is added automatically, so never introduce yourself again.
+
+How to run the conversation:
+- Ask ONE thing at a time. Keep each message to 1 to 3 short sentences.
+- Keep track of what you still need to find out. Never re-ask something already answered.
+- If an answer is vague, ask one clarifying follow-up, then move on.
+- Answer the person's own questions briefly if the instructions let you. Otherwise say ${c.ownerName} will follow up. Never invent facts or make commitments on behalf of ${c.ownerName}.
+- If asked whether you are an AI, say yes.
+- Reply in the same language the person writes in.
+- If they ask you to stop or seem annoyed, apologize and finish.
+- When everything in the instructions is covered, or the person declines to continue, close politely.
+
+"say" is a chat message: plain text, no markdown, at most one emoji.
+
+Reply ONLY with JSON:
+{"say": string, "done": boolean, "summary": string, "answers": [{"question": string, "answer": string}], "notes": string}
+While the conversation continues, set done=false and leave summary, answers and notes empty.
+When you finish, set done=true; "say" is your short closing message, "summary" is 2 to 4 sentences, and "answers" lists every question you asked with the person's answer.`;
+  }
+
   return `You are a friendly, concise assistant chatting on Telegram on behalf of ${c.ownerName}. You are messaging ${c.name}.
-Today's date is ${new Date().toDateString()}.
+Today's date is ${today}.
 
 You have ALREADY sent this opening message, so do not repeat it: "${c.opening}"
 
@@ -317,6 +430,7 @@ Rules:
 - "say" is a chat message: 1 or 2 short sentences, plain text, no markdown, at most one emoji.
 - Never invent facts or make commitments on behalf of ${c.ownerName}. If asked something you don't know, say ${c.ownerName} will follow up.
 - If asked whether you are an AI, say yes.
+- Reply in the same language the person writes in.
 - If they ask you to stop or seem annoyed, apologize and finish.
 - If their message is off-topic or unclear, gently steer back to the question once.
 
@@ -341,6 +455,15 @@ async function askGemini(conv) {
           available: { type: "STRING", enum: ["yes", "no", "unclear"] },
           time: { type: "STRING" },
           notes: { type: "STRING" },
+          summary: { type: "STRING" },
+          answers: {
+            type: "ARRAY",
+            items: {
+              type: "OBJECT",
+              properties: { question: { type: "STRING" }, answer: { type: "STRING" } },
+              required: ["question", "answer"],
+            },
+          },
         },
         required: ["say", "done"],
       },
